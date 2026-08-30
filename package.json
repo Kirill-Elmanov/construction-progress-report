@@ -1,0 +1,26 @@
+{
+  "name": "rost-report",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "turbo build",
+    "dev": "turbo dev",
+    "lint": "turbo lint",
+    "typecheck": "turbo typecheck",
+    "db:migrate": "pnpm --filter @rost/db migrate:dev",
+    "db:deploy": "pnpm --filter @rost/db migrate:deploy",
+    "db:seed": "pnpm --filter @rost/db seed",
+    "db:seed:demo": "pnpm --filter @rost/db seed:demo",
+    "test": "pnpm --filter @rost/api test",
+    "db:studio": "pnpm --filter @rost/db studio"
+  },
+  "devDependencies": {
+    "dotenv-cli": "^7.4.0",
+    "turbo": "^2.1.0",
+    "typescript": "^5.5.0"
+  }
+}

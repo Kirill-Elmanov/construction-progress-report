@@ -1,0 +1,7 @@
+{
+  "name": "@rost/ui-config",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": { ".": "./src/index.ts", "./tailwind": "./src/tailwind-preset.ts" },
+  "devDependencies": { "typescript": "^5.5.0" }
+}

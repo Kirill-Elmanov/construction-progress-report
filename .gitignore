@@ -1,0 +1,23 @@
+node_modules/
+.next/
+dist/
+.turbo/
+*.tsbuildinfo
+
+# Локальные настройки и секреты
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*service-account*.json
+*credentials*.json
+
+# Локальные данные и сформированные материалы
+uploads/
+output/
+tmp/
+.pnpm-store/
+cookies.txt

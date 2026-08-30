@@ -1,0 +1,6 @@
+{
+  "name": "@rost/pdf-generator",
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": { "@rost/shared": "workspace:*" }
+}

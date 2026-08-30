@@ -1,0 +1,652 @@
+// ═══════════════════════════════════════════════════════════
+// РОСТ-Отчёт — схема БД (ТЗ v1.1, п.4.2 ERD)
+// PostgreSQL 16 · Prisma 5 · деньги = BigInt (целые РУБЛИ)
+// ═══════════════════════════════════════════════════════════
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── ENUM-типы (4 шт, ТЗ 4.2) ───────────────────────────────
+
+/// Роли: pzgd|gip|stroycontrol|ksp|viewer (RU-лейблы на фронте)
+enum RoleType {
+  superadmin // ← НОВОЕ (для bootstrap!)
+  pzgd
+  head_of_projects // ← НОВОЕ
+  gip
+  gip_deputy // ← НОВОЕ
+  coordinator // ← НОВОЕ
+  stroycontrol
+  ksp
+  viewer
+
+  @@map("role_type")
+}
+
+enum AccessScope {
+  global
+  project
+
+  @@map("access_scope")
+}
+
+enum TrafficLight {
+  green
+  yellow
+  red
+
+  @@map("traffic_light")
+}
+
+enum ReportStatus {
+  draft
+  finalized
+
+  @@map("report_status")
+}
+
+/// 🟢 устранено / 🟡 под контролем / 🔴 критично
+enum IssueStatus {
+  green
+  yellow
+  red
+
+  @@map("issue_status")
+}
+
+// ─── tenants — компания-клиент (мультиарендность на будущее) ─
+
+model Tenant {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  users       User[] // ← ДОБАВИТЬ ЭТУ СТРОКУ
+  projects    Project[]
+  accessLinks AccessLink[]
+
+  @@map("tenants")
+}
+
+// ─── users — админы (email+пароль), ТЗ 4.6 ───────────────
+model User {
+  id                 String      @id @default(uuid()) @db.Uuid
+  tenantId           String      @map("tenant_id") @db.Uuid
+  email              String      @unique
+  passwordHash       String      @map("password_hash")
+  role               RoleType
+  accessScope        AccessScope @map("access_scope")
+  displayName        String      @map("display_name")
+  isActive           Boolean     @default(true) @map("is_active")
+  mustChangePassword Boolean     @default(false) @map("must_change_password")
+  createdAt          DateTime    @default(now()) @map("created_at") @db.Timestamptz
+
+  tenant            Tenant             @relation(fields: [tenantId], references: [id])
+  userProjects      UserProject[]
+  accessLinks       AccessLink[] // created_by
+  reports           Report[] // finalized_by
+  audits            SectionAudit[] // ПР-1.5
+  activationInvites ActivationInvite[]
+
+  @@map("users")
+}
+
+// ─── activation_invites — одноразовая регистрация руководителей ──
+// В БД хранится только SHA-256 токена. После первого использования ссылка
+// помечается usedAt и больше не принимается.
+model ActivationInvite {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz()
+  usedAt    DateTime? @map("used_at") @db.Timestamptz()
+  createdBy String    @map("created_by") @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@map("activation_invites")
+}
+
+// ─── user_projects — назначение project-админов на проекты ───
+model UserProject {
+  userId    String @map("user_id") @db.Uuid
+  projectId String @map("project_id") @db.Uuid
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@id([userId, projectId])
+  @@map("user_projects")
+}
+
+// ─── projects — проект стройки [Секция А] ───────────────────
+
+model Project {
+  id                  String        @id @default(uuid()) @db.Uuid
+  tenantId            String        @map("tenant_id") @db.Uuid
+  name                String // A1
+  address             String // A2
+  customer            String // A3
+  contractor          String // A4 генподрядчик
+  planStart           DateTime      @map("plan_start") @db.Date // A5
+  planFinish          DateTime      @map("plan_finish") @db.Date // A6
+  budget              BigInt // A7 РУБЛИ (не копейки)
+  tepArea             Decimal?      @map("tep_area") @db.Decimal(14, 2) // A8
+  tepPower            String?       @map("tep_power") // A9
+  tepExtra            Json?         @map("tep_extra") // A10 [{key,value}] ≤10
+  previewPhotoKey     String?       @map("preview_photo_key") // A11 ключ в Object Storage
+  delayYellowDays     Int           @default(5) @map("delay_yellow_days") // A12
+  delayRedDays        Int           @default(14) @map("delay_red_days") // A12
+  rdStages            Json          @map("rd_stages") // стадии РД (упоряд. массив)
+  // ── ПР-1.6: корзина (soft delete, только суперадмин) ──
+  deletedAt           DateTime?     @map("deleted_at") @db.Timestamptz()
+  deletedBy           String?       @map("deleted_by") @db.Uuid
+  // ── ПР-2.1: участники проекта ──
+  techCustomer        String?       @map("tech_customer") // Технический заказчик
+  generalDesigner     String?       @map("general_designer") // Генеральный проектировщик
+  // ── ПР-2.1: экспертиза и разрешения ──
+  expertiseConclusion String?       @map("expertise_conclusion")
+  buildPermit         String?       @map("build_permit")
+  // ── ПР-2.4: технические условия (массив {kind, org}) ──
+  technicalConditions Json?         @map("technical_conditions")
+  // ── ПР-6.4 / Т-2: стадия проекта ──
+  projectStage        String?       @map("project_stage")
+  planrAttrMap        Json?         @map("planr_attr_map") // Этап 2
+  planrEpsId          String?       @map("planr_eps_id") // Этап 2
+  // Правки v6: интеграции настраиваются отдельно для каждого объекта.
+  rdSheetUrl          String?       @map("rd_sheet_url")
+  scheduleReportMode  String        @default("manual") @map("schedule_report_mode") // manual | s_curve
+  createdAt           DateTime      @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt           DateTime      @updatedAt @map("updated_at") @db.Timestamptz()
+  userProjects        UserProject[] // ← ДОБАВИТЬ (среди других связей Project)
+
+  tenant            Tenant               @relation(fields: [tenantId], references: [id])
+  accessGrants      AccessGrant[]
+  contractors       Contractor[]
+  sections          Section[]
+  reports           Report[]
+  scheduleItems     ScheduleItem[] // ПР-4.3: график работ
+  planrItems        PlanrScheduleItem[] // последний снимок WBS для S-кривой
+  planrProgress     PlanrProgressPoint[] // накопительный факт по отчётным датам
+  sectionWorkspaces SectionWorkspace[] // локальные черновики и версии разделов
+
+  @@index([tenantId])
+  @@map("projects")
+}
+
+// ─── access_links — персональные токены сотрудников [Этап 2] ─────
+// Токен принадлежит человеку, а не проекту. Проектные права вынесены
+// в AccessGrant, поэтому одна ссылка открывает все назначенные проекты.
+
+model AccessLink {
+  id              String    @id @default(uuid()) @db.Uuid
+  tenantId        String    @map("tenant_id") @db.Uuid
+  token           String    @unique // 64 симв. crypto.randomBytes
+  role            RoleType
+  // Правки v6: один токен, но руководитель явно выбирает доступные проекты.
+  allowedSections String[]  @default([]) @map("allowed_sections")
+  email           String? // 🆕 ПР-1.5: связь с Google-справочником
+  displayName     String?   @map("display_name") // fallback, если нет в таблице
+  createdBy       String?   @map("created_by") @db.Uuid
+  isActive        Boolean   @default(true) @map("is_active")
+  lastUsedAt      DateTime? @map("last_used_at") @db.Timestamptz() // 🆕
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+
+  tenant  Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  creator User?          @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  audits  SectionAudit[]
+  grants  AccessGrant[]
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+  @@map("access_links")
+}
+
+// ─── access_grants — права токена внутри конкретного проекта ──────
+model AccessGrant {
+  id              String   @id @default(uuid()) @db.Uuid
+  linkId          String   @map("link_id") @db.Uuid
+  projectId       String   @map("project_id") @db.Uuid
+  allowedSections String[] @map("allowed_sections")
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  link    AccessLink @relation(fields: [linkId], references: [id], onDelete: Cascade)
+  project Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([linkId, projectId])
+  @@index([projectId])
+  @@map("access_grants")
+}
+
+// ─── section_workspaces — текущие черновики разделов [Этап 3] ────
+// Обычное сохранение меняет только draftPayload. Зафиксированный снимок
+// хранится отдельно в SectionRevision и поэтому больше не редактируется.
+
+model SectionWorkspace {
+  id                String    @id @default(uuid()) @db.Uuid
+  projectId         String    @map("project_id") @db.Uuid
+  sectionKey        String    @map("section_key")
+  draftPayload      Json?     @map("draft_payload")
+  draftSequence     Int       @default(0) @map("draft_sequence")
+  draftUpdatedAt    DateTime? @map("draft_updated_at") @db.Timestamptz()
+  draftActorKind    String?   @map("draft_actor_kind")
+  draftActorId      String?   @map("draft_actor_id") @db.Uuid
+  draftActorName    String?   @map("draft_actor_name")
+  draftActorEmail   String?   @map("draft_actor_email")
+  draftActorRole    String?   @map("draft_actor_role")
+  currentRevisionId String?   @unique @map("current_revision_id") @db.Uuid
+  basedOnRevisionId String?   @map("based_on_revision_id") @db.Uuid
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt         DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  project         Project                 @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  revisions       SectionRevision[]       @relation("WorkspaceRevisions")
+  currentRevision SectionRevision?        @relation("CurrentWorkspaceRevision", fields: [currentRevisionId], references: [id], onDelete: SetNull)
+  basedOnRevision SectionRevision?        @relation("WorkspaceBasedOnRevision", fields: [basedOnRevisionId], references: [id], onDelete: SetNull)
+  events          SectionWorkspaceEvent[]
+
+  @@unique([projectId, sectionKey])
+  @@index([projectId])
+  @@map("section_workspaces")
+}
+
+// ─── section_revisions — неизменяемая история фиксаций ───────────
+model SectionRevision {
+  id                  String   @id @default(uuid()) @db.Uuid
+  workspaceId         String   @map("workspace_id") @db.Uuid
+  version             Int
+  payload             Json
+  sourceDraftSequence Int      @map("source_draft_sequence")
+  correctionOfId      String?  @map("correction_of_id") @db.Uuid
+  actorKind           String   @map("actor_kind")
+  actorId             String   @map("actor_id") @db.Uuid
+  actorName           String   @map("actor_name")
+  actorEmail          String?  @map("actor_email")
+  actorRole           String   @map("actor_role")
+  fixedAt             DateTime @default(now()) @map("fixed_at") @db.Timestamptz()
+
+  workspace       SectionWorkspace        @relation("WorkspaceRevisions", fields: [workspaceId], references: [id], onDelete: Cascade)
+  currentFor      SectionWorkspace?       @relation("CurrentWorkspaceRevision")
+  basedOnFor      SectionWorkspace[]      @relation("WorkspaceBasedOnRevision")
+  correctionOf    SectionRevision?        @relation("SectionRevisionCorrections", fields: [correctionOfId], references: [id], onDelete: SetNull)
+  corrections     SectionRevision[]       @relation("SectionRevisionCorrections")
+  reportSnapshots ReportSectionSnapshot[]
+
+  @@unique([workspaceId, version])
+  @@index([workspaceId, fixedAt])
+  @@map("section_revisions")
+}
+
+// История обычных сохранений нужна для прозрачности, но не является версией.
+model SectionWorkspaceEvent {
+  id          String   @id @default(uuid()) @db.Uuid
+  workspaceId String   @map("workspace_id") @db.Uuid
+  action      String // save | fix | correct
+  actorKind   String   @map("actor_kind")
+  actorId     String   @map("actor_id") @db.Uuid
+  actorName   String   @map("actor_name")
+  actorEmail  String?  @map("actor_email")
+  actorRole   String   @map("actor_role")
+  summary     String?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  workspace SectionWorkspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, createdAt])
+  @@map("section_workspace_events")
+}
+
+// ─── contractors — справочник подрядчиков [Секции Б, З] ─────
+
+model Contractor {
+  id            String  @id @default(uuid()) @db.Uuid
+  projectId     String  @map("project_id") @db.Uuid
+  name          String
+  contactPerson String? @map("contact_person")
+  phone         String?
+
+  project  Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  sections Section[]
+  workLogs WorkLog[]
+
+  @@index([projectId])
+  @@map("contractors")
+}
+
+// ─── sections — справочник разделов работ [Секция Б] ────────
+
+model Section {
+  id           String    @id @default(uuid()) @db.Uuid
+  projectId    String    @map("project_id") @db.Uuid
+  name         String // Б1
+  code         String? // Б2
+  sortOrder    Int       @map("sort_order") // Б3
+  contractorId String?   @map("contractor_id") @db.Uuid // Б4
+  planStart    DateTime  @map("plan_start") @db.Date // Б5
+  planFinish   DateTime  @map("plan_finish") @db.Date // Б6
+  // ── ПР-4.1: фактические даты (вводит человек) ──
+  factStart    DateTime? @map("fact_start") @db.Date
+  factFinish   DateTime? @map("fact_finish") @db.Date
+  // Правки v3: текущую готовность вручную вводит исполнитель.
+  percentDone  Decimal   @default(0) @map("percent_done") @db.Decimal(5, 2)
+  planrWbsId   String?   @map("planr_wbs_id") // Этап 2
+
+  project    Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  contractor Contractor?       @relation(fields: [contractorId], references: [id], onDelete: SetNull)
+  progress   SectionProgress[]
+  workLogs   WorkLog[]
+  photos     Photo[]
+
+  @@index([projectId])
+  @@map("sections")
+}
+
+// ─── reports — отчёт за неделю [Секция К] ───────────────────
+
+model Report {
+  id              String       @id @default(uuid()) @db.Uuid
+  projectId       String       @map("project_id") @db.Uuid
+  weekFriday      DateTime     @map("week_friday") @db.Date // В1 (пятница, МСК)
+  status          ReportStatus @default(draft)
+  version         Int          @default(1) // корректировки
+  parentReportId  String?      @map("parent_report_id") @db.Uuid
+  // ПР-5.1: какие секции выводить в финальный отчёт (массив литер ["А","Б",…])
+  // null = все включены (дефолт для старых отчётов)
+  enabledSections Json?        @map("enabled_sections")
+  finalizedAt     DateTime?    @map("finalized_at") @db.Timestamptz()
+  finalizedBy     String?      @map("finalized_by") @db.Uuid
+  pdfKey          String?      @map("pdf_key") // Object Storage
+  dashboardToken  String?      @unique @map("dashboard_token") // TTL 30 дн (по created_at)
+  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz()
+
+  project       Project                 @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  finalizer     User?                   @relation(fields: [finalizedBy], references: [id], onDelete: SetNull)
+  parentReport  Report?                 @relation("ReportAmendments", fields: [parentReportId], references: [id], onDelete: Cascade)
+  amendments    Report[]                @relation("ReportAmendments")
+  progress      SectionProgress[]
+  issues        Issue[]
+  prescription  Prescription?
+  budget        BudgetWeekly?
+  rdDevelopment RdDevelopment? // ПР-6.4
+  resources     ResourcesWeekly?
+  workLogs      WorkLog[]
+  photos        Photo[]
+  audits        SectionAudit[] // ПР-1.5
+  snapshots     ReportSectionSnapshot[] // неизменяемый состав финального отчёта
+
+  @@unique([projectId, weekFriday, version])
+  @@index([projectId, status])
+  @@map("reports")
+}
+
+// ─── report_section_snapshots — данные выпущенного отчёта ────────
+// После финализации строки не обновляются: PDF и дашборд получают тот же
+// набор данных, даже если рабочие черновики проекта уже изменились.
+model ReportSectionSnapshot {
+  id         String   @id @default(uuid()) @db.Uuid
+  reportId   String   @map("report_id") @db.Uuid
+  sectionKey String   @map("section_key")
+  sourceKind String   @map("source_kind") // project | section_revision | empty | legacy
+  revisionId String?  @map("revision_id") @db.Uuid
+  payload    Json
+  capturedAt DateTime @default(now()) @map("captured_at") @db.Timestamptz()
+
+  report   Report           @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  revision SectionRevision? @relation(fields: [revisionId], references: [id], onDelete: SetNull)
+
+  @@unique([reportId, sectionKey])
+  @@index([revisionId])
+  @@map("report_section_snapshots")
+}
+
+// ─── section_progress — прогресс по разделам [Секция В] ─────
+// Расчётные (прирост/отставание/светофор) НЕ хранятся — @rost/shared/calc
+
+model SectionProgress {
+  id          String    @id @default(uuid()) @db.Uuid
+  reportId    String    @map("report_id") @db.Uuid
+  sectionId   String    @map("section_id") @db.Uuid
+  percentDone Decimal   @map("percent_done") @db.Decimal(5, 2) // В3 (0–100)
+  factStart   DateTime? @map("fact_start") @db.Date // В4
+  factFinish  DateTime? @map("fact_finish") @db.Date // В5
+  comment     String? // В6
+  isCritical  Boolean   @default(false) @map("is_critical") // В7
+
+  report  Report  @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  section Section @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+
+  @@unique([reportId, sectionId])
+  @@map("section_progress")
+}
+
+// ─── issues — проблематика [Секция Г] ───────────────────────
+
+model Issue {
+  id            String      @id @default(uuid()) @db.Uuid
+  reportId      String      @map("report_id") @db.Uuid
+  parentIssueId String?     @map("parent_issue_id") @db.Uuid
+  description   String // Г1
+  status        IssueStatus // Г2 (только вручную)
+  action        String // Г3
+  responsible   String? // Г4
+  dueDate       DateTime    @map("due_date") @db.Date // Г5
+  resolvedDate  DateTime?   @map("resolved_date") @db.Date // Г6
+  isArchived    Boolean     @default(false) @map("is_archived") // 🟢 >2 нед → архив
+  createdAt     DateTime    @default(now()) @map("created_at") @db.Timestamptz()
+
+  report      Report  @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  parentIssue Issue?  @relation("IssueChain", fields: [parentIssueId], references: [id], onDelete: SetNull)
+  children    Issue[] @relation("IssueChain")
+
+  @@index([reportId])
+  @@map("issues")
+}
+
+// ─── prescriptions — предписания [Секция Д], 1:1 к отчёту ───
+
+model Prescription {
+  id            String @id @default(uuid()) @db.Uuid
+  reportId      String @unique @map("report_id") @db.Uuid
+  issuedTotal   Int    @map("issued_total") // Д1 нарастающим
+  resolvedTotal Int    @map("resolved_total") // Д2 нарастающим
+
+  report Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@map("prescriptions")
+}
+
+// ─── budget_weekly — бюджет [Секция Е], 1:1 к отчёту ────────
+
+// ─── budget_weekly — Бюджет [Секция Б, ПР-6.3] ──────────────
+// Правки v4: освоение считается только по Б1, остальные показатели — настраиваемые.
+
+model BudgetWeekly {
+  id             String  @id @default(uuid()) @db.Uuid
+  reportId       String  @unique @map("report_id") @db.Uuid
+  spentTotal     BigInt  @map("spent_total") // ⚠️ legacy, оставлен для совместимости
+  paidGp         BigInt  @default(0) @map("paid_gp") // Б1 Оплачено ГП, ₽
+  worksAccepted  BigInt  @default(0) @map("works_accepted") // Б2 Принято работ, ₽
+  rdStage        String? @map("rd_stage") // ⚠️ ПР-6.4: переехало в Project.projectStage
+  comment        String? // Б3
+  optionalFields Json    @default("[]") @map("optional_fields")
+
+  report Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@map("budget_weekly")
+}
+
+// ─── resources_weekly — ресурсы [Секция Ж], 1:1 к отчёту ────
+
+model ResourcesWeekly {
+  id        String  @id @default(uuid()) @db.Uuid
+  reportId  String  @unique @map("report_id") @db.Uuid
+  itr       Int // Ж1
+  workers   Int // Ж2
+  machinery Int // Ж3
+  comment   String? // Ж4
+
+  report Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@map("resources_weekly")
+}
+
+// ─── work_log — перечень работ за период [Секция З] ─────────
+
+model WorkLog {
+  id           String   @id @default(uuid()) @db.Uuid
+  reportId     String   @map("report_id") @db.Uuid
+  contractorId String   @map("contractor_id") @db.Uuid // З1
+  sectionId    String?  @map("section_id") @db.Uuid // З2
+  description  String // З3
+  // ПР-6.5: unit/volumeWeek/volumeTotal убраны из интерфейса,
+  // поля оставлены в БД для сохранности исторических данных
+  unit         String?
+  volumeWeek   Decimal? @map("volume_week") @db.Decimal(14, 3)
+  volumeTotal  Decimal? @map("volume_total") @db.Decimal(14, 3)
+  percentDone  Decimal? @map("percent_done") @db.Decimal(5, 2) // 🆕 % выполнения
+
+  report     Report     @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  contractor Contractor @relation(fields: [contractorId], references: [id], onDelete: Cascade)
+  section    Section?   @relation(fields: [sectionId], references: [id], onDelete: SetNull)
+
+  @@index([reportId])
+  @@map("work_log")
+}
+
+// ─── photos — фотоотчёт [Секция И] ──────────────────────────
+
+model Photo {
+  id         String    @id @default(uuid()) @db.Uuid
+  reportId   String    @map("report_id") @db.Uuid
+  storageKey String    @map("storage_key") // оригинал в Object Storage
+  thumbKey   String    @map("thumb_key") // сжатая ~800КБ
+  caption    String? // И2
+  sectionId  String?   @map("section_id") @db.Uuid // И3
+  shotDate   DateTime? @map("shot_date") @db.Date // И4 (EXIF)
+  sortOrder  Int       @map("sort_order") // drag-and-drop
+
+  report  Report   @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  section Section? @relation(fields: [sectionId], references: [id], onDelete: SetNull)
+
+  @@index([reportId])
+  @@map("photos")
+}
+
+// ─── schedule_items — График работ за отчётный период [ПР-4.3] ──
+// Иерархия задаётся полем code: «1.1» → «1.1.1» → «1.1.7.1».
+// До настройки интеграции заполняется вручную; затем обновляется из PLAN-R (/wbs).
+
+model ScheduleItem {
+  id          String    @id @default(uuid()) @db.Uuid
+  projectId   String    @map("project_id") @db.Uuid
+  code        String // «1.1.7.1» — задаёт уровень вложенности
+  name        String // Наименование работ
+  planStart   DateTime? @map("plan_start") @db.Date
+  planFinish  DateTime? @map("plan_finish") @db.Date
+  delayDays   Int?      @map("delay_days") // отставание, со знаком (+55 / −10)
+  percentDone Decimal?  @map("percent_done") @db.Decimal(5, 2) // выполнение на дату
+  weekGrowth  Decimal?  @map("week_growth") @db.Decimal(5, 2) // прирост за неделю
+  sortOrder   Int       @map("sort_order")
+  planrWbsId  String?   @map("planr_wbs_id") // Этап 2
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@map("schedule_items")
+}
+
+// ─── planr_schedule_items — последний снимок WBS PLAN-R ─────────
+// Не смешиваем его с ручным графиком: резервная таблица сохраняется всегда.
+model PlanrScheduleItem {
+  id             String    @id @default(uuid()) @db.Uuid
+  projectId      String    @map("project_id") @db.Uuid
+  wbsId          String    @map("wbs_id")
+  parentWbsId    String?   @map("parent_wbs_id")
+  code           String?
+  name           String
+  nodeType       String?   @map("node_type")
+  targetStart    DateTime? @map("target_start") @db.Date
+  targetFinish   DateTime? @map("target_finish") @db.Date
+  forecastStart  DateTime? @map("forecast_start") @db.Date
+  forecastFinish DateTime? @map("forecast_finish") @db.Date
+  percentDone    Decimal?  @map("percent_done") @db.Decimal(5, 2)
+  sortOrder      Int       @map("sort_order")
+  syncedAt       DateTime  @map("synced_at") @db.Timestamptz()
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, wbsId])
+  @@index([projectId, parentWbsId])
+  @@map("planr_schedule_items")
+}
+
+// Каждая актуализация на дату отчёта добавляет точку факта, не переписывая прошлое.
+model PlanrProgressPoint {
+  id          String   @id @default(uuid()) @db.Uuid
+  projectId   String   @map("project_id") @db.Uuid
+  scopeWbsId  String   @map("scope_wbs_id")
+  scopeName   String   @map("scope_name")
+  asOfDate    DateTime @map("as_of_date") @db.Date
+  percentDone Decimal  @map("percent_done") @db.Decimal(5, 2)
+  capturedAt  DateTime @default(now()) @map("captured_at") @db.Timestamptz()
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, scopeWbsId, asOfDate])
+  @@index([projectId, asOfDate])
+  @@map("planr_progress_points")
+}
+
+// ─── rd_development — Разработка РД [Секция В, ПР-6.4] ──────
+// До настройки интеграции доступен ручной ввод; затем — обновление из Google-таблицы.
+
+model RdDevelopment {
+  id               String @id @default(uuid()) @db.Uuid
+  reportId         String @unique @map("report_id") @db.Uuid
+  volumesTotal     Int    @default(0) @map("volumes_total") // Всего томов
+  handedToCustomer Int    @default(0) @map("handed_to_customer") // Передано Тех. Заказчику
+  onReview         Int    @default(0) @map("on_review") // На проверке
+  issuedVpr        Int    @default(0) @map("issued_vpr") // Выдано ВПР
+  inProgress       Int    @default(0) @map("in_progress") // В разработке
+  withRemarks      Int    @default(0) @map("with_remarks") // Выданы замечания
+
+  report Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@map("rd_development")
+}
+
+// ─── section_audit — аудит правок по секциям [ПР-1.5] ───────
+// Кто, когда и что менял в каждой секции отчёта.
+// Актор — либо User (вход по паролю), либо AccessLink (вход по ссылке).
+
+model SectionAudit {
+  id          String   @id @default(uuid()) @db.Uuid
+  reportId    String   @map("report_id") @db.Uuid
+  sectionKey  String   @map("section_key") // литера: «Б», «Г», «И»…
+  action      String // save | finalize | amend | delete
+  actorKind   String   @map("actor_kind") // user | link
+  actorUserId String?  @map("actor_user_id") @db.Uuid
+  actorLinkId String?  @map("actor_link_id") @db.Uuid
+  actorName   String   @map("actor_name") // ФИО на момент правки
+  actorEmail  String?  @map("actor_email")
+  actorRole   String   @map("actor_role")
+  summary     String? // краткое описание изменения
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  report    Report      @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  actorUser User?       @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+  actorLink AccessLink? @relation(fields: [actorLinkId], references: [id], onDelete: SetNull)
+
+  @@index([reportId, sectionKey])
+  @@map("section_audit")
+}

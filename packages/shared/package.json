@@ -1,0 +1,12 @@
+{
+  "name": "@rost/shared",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    "./types": "./src/types/index.ts",
+    "./zod": "./src/zod/index.ts",
+    "./calc": "./src/calc/index.ts"
+  },
+  "dependencies": { "zod": "^3.23.0" },
+  "devDependencies": { "typescript": "^5.5.0" }
+}
